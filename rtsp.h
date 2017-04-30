@@ -34,44 +34,30 @@
 
 #include "lwip/tcp.h"
 
-enum RTSPStatusCode {
-	RTSP_STATUS_OK             = 200,
-	RTSP_STATUS_METHOD         = 405,
-	RTSP_STATUS_BANDWIDTH      = 453,
-	RTSP_STATUS_SESSION        = 454,
-	RTSP_STATUS_STATE          = 455,
-	RTSP_STATUS_AGGREGATE      = 459,
-	RTSP_STATUS_ONLY_AGGREGATE = 460,
-	RTSP_STATUS_TRANSPORT      = 461,
-	RTSP_STATUS_INTERNAL       = 500,
-	RTSP_STATUS_SERVICE        = 503,
-	RTSP_STATUS_VERSION        = 505
-};
-
-enum State {
+typedef enum State {
 	INIT      = 0,
 	OPTIONS,
 	DESCRIBE,
 	SETUP,
 	PLAY,
 	PAUSE
-};
+} State;
 
 typedef struct RTSPHeader {
-	int content_length;
-	enum RTSPStatusCode status_code;
-	int c_seq;
+	u16_t content_length;
+	u16_t status_code;
+	u8_t c_seq;
 	long session_id;
 } RTSPHeader;
 
 typedef struct RTSPSession {
-	int c_seq;
-	char uri[256];
-	enum State state;
-	enum State requested_state;
+	u8_t c_seq;
 	long session_id;
+	State state;
+	State requested_state;
+	s8_t uri[256];
 	ip4_addr_t ip;
-	int port;
+	u16_t port;
 	struct tcp_pcb *pcb;
 } RTSPSession;
 
@@ -79,8 +65,5 @@ err_t rtsp_setup(RTSPSession *session, const char *uri);
 err_t rtsp_play(RTSPSession *session);
 err_t rtsp_pause(RTSPSession *session);
 err_t rtsp_teardown(RTSPSession *session);
-
-}
-
 
 #endif // _RTSP_H_

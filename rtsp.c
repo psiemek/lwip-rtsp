@@ -30,6 +30,7 @@
  */
 
 #include "rtsp.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -43,6 +44,8 @@
 
 #define CRLF           "\r\n"
 
+#define RTSP_STATUS_OK 200
+
 static err_t tcp_send_packet(RTSPSession *session, const char *packet);
 static u8_t starts_with(const char *str, const char *pfx, const char **ptr);
 static const char *find_line_break(const char *buffer);
@@ -51,28 +54,26 @@ static const char *rtsp_parse_response(RTSPHeader *reply, const char *response);
 static err_t send_packet(RTSPSession *session, const char *command);
 static err_t send_next_packet(RTSPSession *session);
 static err_t receive_response(RTSPSession *session, char *server_reply);
-static err_t parse_uri(RTSPSession *session, const char *uri);
+static err_t parse_url(RTSPSession *session, const char *uri);
 static err_t rtsp_connected_clbk(void *arg, struct tcp_pcb *tpcb, err_t err);
 static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
-static err_t rtsp_error_clbk(void *arg, err_t err);
+static void rtsp_error_clbk(void *arg, err_t err);
 static err_t disconnect_server(RTSPSession *session);
 static err_t connect_server(RTSPSession *session);
 
 static err_t tcp_send_packet(RTSPSession *session, const char *packet) {
+    err_t result;
+
     LWIP_ASSERT("session != NULL", session != NULL);
 
-    err_t error;
-
-    error = tcp_write(session->pcb, packet, strlen(packet), TCP_WRITE_FLAG_COPY);
-    if (error != ERR_OK) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("ERROR: Code: %d (tcp_send_packet :: tcp_write)\n", error));
-        return error;
+    if ((result = tcp_write(session->pcb, packet, strlen(packet), TCP_WRITE_FLAG_COPY)) != ERR_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("tcp_send_packet: Write error %d\n", result));
+        return result;
     }
 
-    error = tcp_output(session->pcb);
-    if (error != ERR_OK) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("ERROR: Code: %d (tcp_send_packet :: tcp_output)\n", error));
-        return error;
+    if ((result = tcp_output(session->pcb)) != ERR_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("tcp_send_packet: Output error %d\n", result));
+        return result;
     }
 
     return ERR_OK;
@@ -91,9 +92,9 @@ static u8_t starts_with(const char *str, const char *pfx, const char **ptr) {
 }
 
 static const char *find_line_break(const char *buffer) {
-    if(buffer == NULL) return NULL;
-
     const char *pt = buffer;
+
+    LWIP_ASSERT("buffer != NULL", buffer != NULL);
 
     while(*pt != '\0' && strncmp(pt, CRLF, 2) != 0) {
         ++pt;
@@ -106,9 +107,9 @@ static const char *find_line_break(const char *buffer) {
 }
 
 static void rtsp_parse_line(RTSPHeader *reply, const char *buf) {
-    LWIP_ASSERT("reply != NULL", reply != NULL);
-
     const char *p;
+
+    LWIP_ASSERT("reply != NULL", reply != NULL);
 
     if (starts_with(buf, "Session:", &p)) {
         reply->session_id = strtol(p, NULL, 10);
@@ -122,12 +123,11 @@ static void rtsp_parse_line(RTSPHeader *reply, const char *buf) {
 }
 
 static const char *rtsp_parse_response(RTSPHeader *reply, const char *response) {
-    LWIP_ASSERT("reply != NULL", reply != NULL);
-
-    if(response == NULL) return NULL;
-
     const char *line_break;
     const char *pt = response;
+
+    LWIP_ASSERT("reply != NULL", reply != NULL);
+    LWIP_ASSERT("response != NULL", response != NULL);
 
     while(pt) {
         rtsp_parse_line(reply, pt);
@@ -145,31 +145,32 @@ static const char *rtsp_parse_response(RTSPHeader *reply, const char *response) 
 struct tcp_pcb *testpcb;
 
 static err_t send_packet(RTSPSession *session, const char *command) {
+    char packet[256];
+
     LWIP_ASSERT("session != NULL", session != NULL);
     LWIP_ASSERT("command != NULL", command != NULL);
-
-    char packet[256];
 
     sprintf(packet, "%s %s RTSP/1.0" CRLF "CSeq: %d" CRLF,
             command,
             session->uri,
             ++session->c_seq);
 
+    // Include session id if the session is set up
     if(session->state > DESCRIBE) {
         LWIP_ASSERT("session->session_id != 0", session->session_id != 0);
 
-        sprintf(packet + strlen(packet), "Session: %ld" CRLF CRLF, session->session_id);
-    } else {
-        sprintf(packet + strlen(packet), CRLF);
+        sprintf(packet + strlen(packet), "Session: %ld" CRLF, session->session_id);
     }
+
+    sprintf(packet + strlen(packet), CRLF);
 
     return tcp_send_packet(session, packet);
 }
 
 static err_t send_next_packet(RTSPSession *session) {
-    LWIP_ASSERT("session != NULL", session != NULL);
-
     err_t res;
+
+    LWIP_ASSERT("session != NULL", session != NULL);
 
     switch(session->state) {
     case INIT:
@@ -192,10 +193,11 @@ static err_t send_next_packet(RTSPSession *session) {
 }
 
 static err_t receive_response(RTSPSession *session, char *server_reply) {
-    LWIP_ASSERT("session != NULL", session != NULL);
-
     RTSPHeader reply;
     const char *header_end;
+
+    LWIP_ASSERT("session != NULL", session != NULL);
+    LWIP_ASSERT("server_reply != NULL", server_reply != NULL);
 
     memset(&reply, 0, sizeof(RTSPHeader));
 
@@ -284,27 +286,37 @@ err_t rtsp_teardown(RTSPSession *session) {
         return -1;
     }
 
-    session->requested_state = INIT;
-
-    return ERR_OK;
+    return disconnect_server(session);
 }
 
-static err_t parse_uri(RTSPSession *session, const char *uri) {
+static err_t parse_url(RTSPSession *session, const char *uri) {
     /* Need a real parser ! */
+    err_t res;
+    u16_t scanned;
 
     LWIP_ASSERT("session != NULL", session != NULL);
 
     char ip_address[16];
 
-    u16_t res;
-    res = sscanf(uri, "rtsp://%99[^:]:%99d/%99[^\n]",
+    scanned = sscanf(uri, "rtsp://%99[^:]:%99hu/%99[^\n]",
             ip_address,
             &session->port,
             session->uri);
 
-    int err = ipaddr_aton(ip_address, &session->ip);
+    if(scanned != 3) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("parse_url: Malformed URL\n"));
 
-    return (res == 3 && err == 1) ? ERR_OK : ERR_ARG;
+        return ERR_ARG;
+    }
+
+    res = ipaddr_aton(ip_address, &session->ip);
+    if(res != 1) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("parse_url: Malformed URL\n"));
+
+        return ERR_ARG;
+    }
+
+    return ERR_OK;
 }
 
 static err_t rtsp_connected_clbk(void *arg, struct tcp_pcb *tpcb, err_t err) {
@@ -322,14 +334,8 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     RTSPSession *session = (RTSPSession *)arg;
 
     LWIP_ASSERT("session != NULL", session != NULL);
-    LWIP_DEBUGF(RTSP_DEBUG, ("Data recieved.\n"));
 
-    if (p == NULL) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("The remote host closed the connection.\n"));
-        disconnect_server(session);
-        return ERR_ABRT;
-    } else {
-        LWIP_DEBUGF(RTSP_DEBUG, ("Number of pbufs %d\n", pbuf_clen(p)));
+    if (p) {
         LWIP_DEBUGF(RTSP_DEBUG, ("Contents of pbuf %s\n", (char *)p->payload));
 
         struct pbuf *q;
@@ -342,6 +348,7 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
         }
         *pt = '\0';
 
+        /* Inform TCP that we have taken the data */
         tcp_recved(session->pcb, p->tot_len);
 
         receive_response(session, text);
@@ -352,19 +359,23 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
             return ERR_OK;
 
         send_next_packet(session);
+    } else {
+        LWIP_DEBUGF(RTSP_DEBUG, ("rtsp_recvd_clbk: Host closed the connection\n"));
+
+        disconnect_server(session);
+
+        return ERR_ABRT;
     }
 
     return ERR_OK;
 }
 
-static err_t rtsp_error_clbk(void *arg, err_t err) {
+static void rtsp_error_clbk(void *arg, err_t err) {
     RTSPSession *session = (RTSPSession *)arg;
 
     LWIP_ASSERT("session != NULL", session != NULL);
 
     disconnect_server(session);
-
-    return ERR_OK;
 }
 
 static err_t disconnect_server(RTSPSession *session) {
@@ -372,6 +383,8 @@ static err_t disconnect_server(RTSPSession *session) {
     tcp_sent(session->pcb, NULL);
     tcp_recv(session->pcb, NULL);
     tcp_close(session->pcb);
+
+    memset(session, 0, sizeof(RTSPSession));
 
     return ERR_OK;
 }
@@ -401,14 +414,12 @@ err_t rtsp_setup(RTSPSession *session, const char *uri) {
     session->pcb = tcp_new();
     tcp_arg(session->pcb, session);
 
-    res = parse_uri(session, uri);
-    if(res != ERR_OK) {
+    if((res = parse_url(session, uri)) != ERR_OK) {
         LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Invalid address : %d\n", res));
         return res;
     }
 
-    res = connect_server(session);
-    if(res != ERR_OK) {
+    if((res = connect_server(session)) != ERR_OK) {
         LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Connect error : %d\n", res));
         return res;
     }

@@ -150,7 +150,7 @@ static err_t send_packet(RTSPSession *session, const char *command) {
 
     char packet[256];
 
-    sprintf(packet, "%s %s RTSP/5.0" CRLF "CSeq: %d" CRLF,
+    sprintf(packet, "%s %s RTSP/1.0" CRLF "CSeq: %d" CRLF,
             command,
             session->uri,
             ++session->c_seq);
@@ -201,6 +201,12 @@ static err_t receive_response(RTSPSession *session, char *server_reply) {
 
     header_end = rtsp_parse_response(&reply, server_reply);
 
+    if(reply.c_seq != session->c_seq) {
+        /* Maybe server sent something without our request ? */
+        LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Sequence numbers do not match\n"));
+        return -1;
+    }
+
     if(reply.status_code != RTSP_STATUS_OK) {
         LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Server denied %d\n", reply.status_code));
         return -1;
@@ -215,11 +221,6 @@ static err_t receive_response(RTSPSession *session, char *server_reply) {
 
             // TODO : Do something with the payload
         }
-    }
-
-    if(reply.c_seq != session->c_seq) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Sequence numbers do not match\n"));
-        return -1;
     }
 
     if(session->state == SETUP) {
@@ -289,6 +290,8 @@ err_t rtsp_teardown(RTSPSession *session) {
 }
 
 static err_t parse_uri(RTSPSession *session, const char *uri) {
+    /* Need a real parser ! */
+
     LWIP_ASSERT("session != NULL", session != NULL);
 
     char ip_address[16];
@@ -348,7 +351,6 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
         if(session->state == SETUP)
             return ERR_OK;
 
-        LWIP_DEBUGF(RTSP_DEBUG, ("Sending next packet\n"));
         send_next_packet(session);
     }
 

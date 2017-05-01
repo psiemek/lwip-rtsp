@@ -32,16 +32,34 @@
 #ifndef _RTSP_H_
 #define _RTSP_H_
 
+#include "lwipopts.h"
+
+#if LWIP_TCP
+
 #include "lwip/tcp.h"
 
 typedef enum State {
 	INIT      = 0,
-	OPTIONS,
-	DESCRIBE,
-	SETUP,
-	PLAY,
-	PAUSE
+	OPTIONS   = 1,
+	DESCRIBE  = 2,
+	SETUP     = 3,
+	PLAY      = 4,
+	PAUSE     = 5,
+	TEARDOWN  = 6
 } State;
+
+typedef struct RTPHeader {
+	u8_t version;
+	u8_t payload_type;
+	u16_t sequence_number;
+	u32_t timestamp;
+	u32_t ssrc;
+} RTPHeader;
+
+typedef struct RTPSession {
+	u16_t sequence_number;
+	u32_t lost_packets;
+} RTPSession;
 
 typedef struct RTSPHeader {
 	u16_t content_length;
@@ -56,14 +74,20 @@ typedef struct RTSPSession {
 	State state;
 	State requested_state;
 	s8_t uri[256];
+	s8_t url[256];
+	s8_t control_url[256];
 	ip4_addr_t ip;
 	u16_t port;
 	struct tcp_pcb *pcb;
+	struct udp_pcb *rtp_pcb;
+	struct RTPSession rtp_session;
 } RTSPSession;
 
 err_t rtsp_setup(RTSPSession *session, const char *uri);
 err_t rtsp_play(RTSPSession *session);
 err_t rtsp_pause(RTSPSession *session);
 err_t rtsp_teardown(RTSPSession *session);
+
+#endif /* LWIP_TCP */
 
 #endif // _RTSP_H_

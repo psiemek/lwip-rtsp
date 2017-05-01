@@ -30,6 +30,7 @@
  */
 
 #include "rtsp.h"
+#include "lwip/udp.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -45,15 +46,14 @@
 #define CRLF           "\r\n"
 
 #define RTSP_STATUS_OK 200
+#define RTP_PORT       55852
 
 static err_t tcp_send_packet(RTSPSession *session, const char *packet);
 static u8_t starts_with(const char *str, const char *pfx, const char **ptr);
 static const char *find_line_break(const char *buffer);
 static void rtsp_parse_line(RTSPHeader *reply, const char *buf);
 static const char *rtsp_parse_response(RTSPHeader *reply, const char *response);
-static err_t send_packet(RTSPSession *session, const char *command);
-static err_t send_next_packet(RTSPSession *session);
-static err_t receive_response(RTSPSession *session, char *server_reply);
+static err_t process_response(RTSPSession *session, char *server_reply);
 static err_t parse_url(RTSPSession *session, const char *uri);
 static err_t rtsp_connected_clbk(void *arg, struct tcp_pcb *tpcb, err_t err);
 static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
@@ -75,6 +75,8 @@ static err_t tcp_send_packet(RTSPSession *session, const char *packet) {
         LWIP_DEBUGF(RTSP_DEBUG, ("tcp_send_packet: Output error %d\n", result));
         return result;
     }
+
+    LWIP_DEBUGF(RTSP_DEBUG, ("%s\n", packet));
 
     return ERR_OK;
 }
@@ -142,96 +144,197 @@ static const char *rtsp_parse_response(RTSPHeader *reply, const char *response) 
     return NULL;
 }
 
-struct tcp_pcb *testpcb;
+static void rtp_parse_header(RTPHeader *header, const char *payload) {
+    LWIP_ASSERT("header != NULL", header != NULL);
 
-static err_t send_packet(RTSPSession *session, const char *command) {
-    char packet[256];
+    if(payload == NULL) return;
 
-    LWIP_ASSERT("session != NULL", session != NULL);
-    LWIP_ASSERT("command != NULL", command != NULL);
-
-    sprintf(packet, "%s %s RTSP/1.0" CRLF "CSeq: %d" CRLF,
-            command,
-            session->uri,
-            ++session->c_seq);
-
-    // Include session id if the session is set up
-    if(session->state > DESCRIBE) {
-        LWIP_ASSERT("session->session_id != 0", session->session_id != 0);
-
-        sprintf(packet + strlen(packet), "Session: %ld" CRLF, session->session_id);
-    }
-
-    sprintf(packet + strlen(packet), CRLF);
-
-    return tcp_send_packet(session, packet);
+    header->version         = (payload[0] & 0xc0) >> 6;
+    header->payload_type    = (payload[1] & 0x7F);
+    header->sequence_number = (payload[3])  | (payload[2]  << 8);
+    header->timestamp       = (payload[7])  | (payload[6]  << 8) | (payload[5] << 16) | (payload[4] << 24);
+    header->ssrc            = (payload[11]) | (payload[10] << 8) | (payload[9] << 16) | (payload[8] << 24);
 }
 
-static err_t send_next_packet(RTSPSession *session) {
-    err_t res;
+static err_t rtp_process_header(RTPSession *session, RTPHeader *header) {
+    LWIP_ASSERT("header != NULL", header != NULL);
+    LWIP_ASSERT("session != NULL", session != NULL);
+
+    u32_t lost_packets = (header->sequence_number - session->sequence_number) - 1;
+    if(lost_packets != 0) {
+        session->lost_packets += lost_packets;
+    }
+
+    session->sequence_number = header->sequence_number;
+
+    return ERR_OK;
+}
+
+static void rtp_recvd_clbk(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port) {
+    RTPHeader header;
+    RTPSession *session = (RTPSession *)arg;
 
     LWIP_ASSERT("session != NULL", session != NULL);
 
-    switch(session->state) {
-    case INIT:
-        res = send_packet(session, "OPTIONS");
-        session->requested_state = OPTIONS;
-        break;
-    case OPTIONS:
-        res = send_packet(session, "DESCRIBE");
-        session->requested_state = DESCRIBE;
-        break;
-    case DESCRIBE:
-        res = send_packet(session, "SETUP");
-        session->requested_state = SETUP;
-        break;
-    default:
-        res = ERR_VAL;
+    if(p == NULL) return;
+
+    rtp_parse_header(&header, (const char *)p->payload);
+    rtp_process_header(session, &header);
+
+    // TODO : Handle RTP data
+
+    pbuf_free(p);
+}
+
+static err_t rtp_setup(RTSPSession *session) {
+    err_t res;
+
+    LWIP_DEBUGF(RTSP_DEBUG, ("rtp_setup: Opening RTP port %d\n", RTP_PORT));
+
+    session->rtp_pcb = udp_new();
+    udp_recv(session->rtp_pcb, rtp_recvd_clbk, &session->rtp_session);
+
+    if((res = udp_bind(session->rtp_pcb, IP_ADDR_ANY, RTP_PORT)) != ERR_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("rtp_setup: Bind error\n"));
     }
 
     return res;
 }
 
-static err_t receive_response(RTSPSession *session, char *server_reply) {
+static err_t rtsp_send_cmd(RTSPSession *session, State state) {
+    err_t res = ERR_OK;
+    char packet[256];
+    char *pt = packet;
+
+    LWIP_ASSERT("session != NULL", session != NULL);
+
+    session->requested_state = state;
+
+    switch(session->requested_state) {
+    case OPTIONS:
+        pt += sprintf(pt, "OPTIONS %s", session->url);
+        break;
+    case DESCRIBE:
+        pt += sprintf(pt, "DESCRIBE %s", session->url);
+        break;
+    case SETUP:
+        pt += sprintf(pt, "SETUP %s/%s", session->url, session->control_url);
+        break;
+    case PLAY:
+        pt += sprintf(pt, "PLAY %s/%s", session->url, session->control_url);
+        break;
+    case TEARDOWN:
+        pt += sprintf(pt, "TEARDOWN %s", session->url);
+        break;
+    default:
+        res = ERR_VAL;
+    }
+
+    if(res == ERR_OK) {
+        pt += sprintf(pt, " RTSP/1.0" CRLF);
+
+        if(session->requested_state == SETUP) {
+            pt += sprintf(pt, "Transport: RTP/AVP;unicast;client_port=%d-%d" CRLF, RTP_PORT, RTP_PORT + 1);
+        }
+
+        pt += sprintf(pt, "CSeq: %d" CRLF CRLF, ++session->c_seq);
+
+        res = tcp_send_packet(session, packet);
+    }
+
+    return res;
+}
+
+static err_t rtsp_parse_sdp(RTSPSession *session, const char *sdp) {
+    const char *pt = sdp;
+    const char *url;
+
+    if(sdp == NULL) return ERR_ARG;
+
+    while(*pt != '\0') {
+        if(strncmp(pt, "a=control:", 10) == 0) {
+            pt += 10;
+            url = pt;
+
+            while(*pt != '\0' && strncmp(pt, CRLF, 2) != 0) {
+                ++pt;
+            }
+
+            if(pt != '\0') {
+                memcpy(session->control_url, url, pt - url);
+                session->control_url[pt - url] = '\0';
+            }
+        }
+        ++pt;
+    }
+
+    return ERR_OK;
+}
+
+err_t check_reply(RTSPSession *session, RTSPHeader *reply) {
+    if(reply->c_seq != session->c_seq) {
+        /* Maybe server sent something without our request ? */
+        LWIP_DEBUGF(RTSP_DEBUG, ("check_reply: Sequence numbers do not match\n"));
+        return -1;
+    }
+
+    if(reply->status_code != RTSP_STATUS_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("check_reply: Server denied %d\n", reply->status_code));
+        return -1;
+    }
+
+    if(session->state > DESCRIBE) {
+        if(session->session_id != reply->session_id) {
+            LWIP_DEBUGF(RTSP_DEBUG, ("check_reply: Invalid session ID\n"));
+            return -1;
+        }
+    }
+
+    return ERR_OK;
+}
+
+static err_t process_reply(RTSPSession *session, RTSPHeader* reply, const char *payload) {
+    session->state = session->requested_state;
+
+    if(session->state > DESCRIBE) {
+        if(session->session_id != reply->session_id) {
+            if(session->session_id == 0) {
+                session->session_id = reply->session_id;
+            }
+        }
+    }
+
+    if(session->state == DESCRIBE) {
+        rtsp_parse_sdp(session, payload);
+        rtp_setup(session);
+    }
+
+    return ERR_OK;
+}
+
+static err_t process_response(RTSPSession *session, char *server_reply) {
+    err_t res;
     RTSPHeader reply;
-    const char *header_end;
+    const char *payload;
 
     LWIP_ASSERT("session != NULL", session != NULL);
     LWIP_ASSERT("server_reply != NULL", server_reply != NULL);
 
     memset(&reply, 0, sizeof(RTSPHeader));
 
-    header_end = rtsp_parse_response(&reply, server_reply);
-
-    if(reply.c_seq != session->c_seq) {
-        /* Maybe server sent something without our request ? */
-        LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Sequence numbers do not match\n"));
-        return -1;
+    if((payload = rtsp_parse_response(&reply, server_reply)) == NULL) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("process_response: Parse error\n"));
+        return ERR_VAL;
     }
 
-    if(reply.status_code != RTSP_STATUS_OK) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("start_rtsp: Server denied %d\n", reply.status_code));
-        return -1;
+    if((res = check_reply(session, &reply)) != ERR_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("process_response: Reply is not valid\n"));
+        return res;
     }
 
-    session->state = session->requested_state;
-
-    if(session->state == DESCRIBE) {
-        if(header_end != NULL) {
-            //LWIP_DEBUGF(RTSP_DEBUG, ("SDP :\n"));
-            //LWIP_DEBUGF(RTSP_DEBUG, ("%s\n", header_end));
-
-            // TODO : Do something with the payload
-        }
-    }
-
-    if(session->state == SETUP) {
-        session->session_id = reply.session_id;
-    } else if(session->state > SETUP) {
-        if(session->session_id != reply.session_id) {
-            LWIP_DEBUGF(RTSP_DEBUG, ("receive_response: Wrong session ID\n"));
-            return -1;
-        }
+    if((res = process_reply(session, &reply, payload)) != ERR_OK) {
+        LWIP_DEBUGF(RTSP_DEBUG, ("process_response: Reply is not valid\n"));
+        return res;
     }
 
     return ERR_OK;
@@ -245,12 +348,10 @@ err_t rtsp_play(RTSPSession *session) {
         return -1;
     }
 
-    if(send_packet(session, "PLAY") < 0) {
+    if(rtsp_send_cmd(session, PLAY) < 0) {
         LWIP_DEBUGF(RTSP_DEBUG, ("rtsp_play: Send error\n"));
         return -1;
     }
-
-    session->requested_state = PLAY;
 
     return ERR_OK;
 }
@@ -263,12 +364,10 @@ err_t rtsp_pause(RTSPSession *session) {
         return -1;
     }
 
-    if(send_packet(session, "PAUSE") < 0) {
+    if(rtsp_send_cmd(session, PAUSE) < 0) {
         LWIP_DEBUGF(RTSP_DEBUG, ("rtsp_pause: Send error\n"));
         return -1;
     }
-
-    session->requested_state = PAUSE;
 
     return ERR_OK;
 }
@@ -281,7 +380,7 @@ err_t rtsp_teardown(RTSPSession *session) {
         return -1;
     }
 
-    if(send_packet(session, "TEARDOWN") < 0) {
+    if(rtsp_send_cmd(session, TEARDOWN) < 0) {
         LWIP_DEBUGF(RTSP_DEBUG, ("rtsp_teardown: Send error\n"));
         return -1;
     }
@@ -316,6 +415,8 @@ static err_t parse_url(RTSPSession *session, const char *uri) {
         return ERR_ARG;
     }
 
+    memcpy(session->url, uri, strlen(uri));
+
     return ERR_OK;
 }
 
@@ -325,7 +426,7 @@ static err_t rtsp_connected_clbk(void *arg, struct tcp_pcb *tpcb, err_t err) {
     LWIP_ASSERT("session != NULL", session != NULL);
     LWIP_DEBUGF(RTSP_DEBUG, ("Connection Established.\n"));
 
-    send_next_packet(session);
+    rtsp_send_cmd(session, OPTIONS);
 
     return ERR_OK;
 }
@@ -336,7 +437,7 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     LWIP_ASSERT("session != NULL", session != NULL);
 
     if (p) {
-        LWIP_DEBUGF(RTSP_DEBUG, ("Contents of pbuf %s\n", (char *)p->payload));
+        LWIP_DEBUGF(RTSP_DEBUG, ("%s\n", (char *)p->payload));
 
         struct pbuf *q;
         char *text = malloc(p->tot_len + 1);
@@ -351,14 +452,12 @@ static err_t rtsp_recvd_clbk(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
         /* Inform TCP that we have taken the data */
         tcp_recved(session->pcb, p->tot_len);
 
-        receive_response(session, text);
+        process_response(session, text);
 
         free(text);
+        pbuf_free(p);
 
-        if(session->state == SETUP)
-            return ERR_OK;
-
-        send_next_packet(session);
+        rtsp_send_cmd(session, session->state + 1);
     } else {
         LWIP_DEBUGF(RTSP_DEBUG, ("rtsp_recvd_clbk: Host closed the connection\n"));
 

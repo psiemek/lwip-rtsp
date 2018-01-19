@@ -293,7 +293,7 @@ err_t check_reply(RTSPSession *session, RTSPHeader *reply) {
     return ERR_OK;
 }
 
-static err_t process_reply(RTSPSession *session, RTSPHeader* reply, const char *payload) {
+static err_t process_reply(RTSPSession *session, RTSPHeader *reply, const char *payload) {
     session->state = session->requested_state;
 
     if(session->state > DESCRIBE) {
